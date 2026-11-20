@@ -1,0 +1,8 @@
+[package]
+name = "wask"
+version = "0.1.0"
+edition = "2024"
+description = "A markdown task runner for humans and agents: mask-compatible, SKILL.md-aware"
+license = "BSL-1.0"
+
+[dependencies]
