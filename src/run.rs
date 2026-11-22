@@ -13,6 +13,14 @@ pub struct Context<'a> {
 
 /// Runs the command and returns its exit code.
 pub fn run(cmd: &Command, vars: &[(String, String)], ctx: &Context) -> Result<i32, String> {
+    if let Some(conflict) = &cmd.conflict {
+        return Err(format!(
+            "`{}` ({}:{}) cannot run: {conflict}",
+            cmd.name,
+            crate::markdown::relative(&cmd.file),
+            cmd.line
+        ));
+    }
     let script = cmd.script.as_ref().ok_or("command has no script")?;
     let mut temp: Option<PathBuf> = None;
     let argv = match script {

@@ -1,5 +1,6 @@
 //! `--introspect`: the command tree as JSON, for tools and agents.
 
+use crate::cli;
 use crate::markdown::Doc;
 use crate::model::{Command, Kind, Script, env_name};
 
@@ -28,7 +29,9 @@ fn array(items: impl Iterator<Item = String>) -> String {
     format!("[{}]", items.collect::<Vec<_>>().join(","))
 }
 
-fn command(cmd: &Command) -> String {
+/// `path` is the command's parents, then the command itself.
+fn command(path: &mut Vec<&Command>) -> String {
+    let cmd = *path.last().expect("path ends with the command");
     let args = array(cmd.args.iter().map(|a| {
         format!(
             "{{\"name\":{},\"env\":{},\"required\":{},\"variadic\":{}}}",
@@ -66,12 +69,22 @@ fn command(cmd: &Command) -> String {
         }
         Some(Script::File(path)) => format!("{{\"file\":{}}}", string(&path.to_string_lossy())),
     };
+    let usage = cli::usage(path);
+    let subs = array(cmd.subs.iter().map(|sub| {
+        path.push(sub);
+        let json = command(path);
+        path.pop();
+        json
+    }));
     format!(
-        "{{\"name\":{},\"description\":{},\"dir\":{},\"args\":{args},\"options\":{options},\"script\":{script},\"subcommands\":{}}}",
+        "{{\"name\":{},\"description\":{},\"usage\":{},\"file\":{},\"line\":{},\"dir\":{},\"args\":{args},\"options\":{options},\"script\":{script},\"error\":{},\"subcommands\":{subs}}}",
         string(&cmd.name),
         string(&cmd.desc),
+        string(&usage),
+        string(&cmd.file.to_string_lossy()),
+        cmd.line,
         string(&cmd.dir.to_string_lossy()),
-        array(cmd.subs.iter().map(command))
+        optional(cmd.conflict.as_deref()),
     )
 }
 
@@ -82,7 +95,7 @@ pub fn document(doc: &Doc, file: &std::path::Path) -> String {
         optional(doc.name.as_deref()),
         optional(doc.title.as_deref()),
         optional(doc.description.as_deref()),
-        array(doc.commands.iter().map(command))
+        array(doc.commands.iter().map(|c| command(&mut vec![c])))
     )
 }
 

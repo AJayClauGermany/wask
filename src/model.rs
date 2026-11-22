@@ -11,9 +11,15 @@ pub struct Command {
     pub args: Vec<Arg>,
     pub options: Vec<Opt>,
     pub script: Option<Script>,
+    /// Why the command cannot run although it is listed: its script is
+    /// ambiguous.
+    pub conflict: Option<String>,
     pub subs: Vec<Command>,
     /// Directory of the markdown file that defined this command.
     pub dir: PathBuf,
+    /// The markdown file and line of the command's heading.
+    pub file: PathBuf,
+    pub line: usize,
     /// Global config, overlaid by the root file's frontmatter, then this file's.
     pub settings: Rc<Settings>,
 }
@@ -49,6 +55,16 @@ pub enum Script {
     Inline { lang: String, source: String },
     /// A file next to the markdown, linked with `@path`.
     File(PathBuf),
+}
+
+/// A heading that looks like a command but is not one, kept so that asking
+/// for it can explain why instead of just saying "unknown command".
+#[derive(Debug, Clone, PartialEq)]
+pub struct NearMiss {
+    pub name: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub reason: String,
 }
 
 /// Environment variable name for an argument or option.

@@ -83,10 +83,14 @@ fn expand_inline(
     let mut out = String::new();
     let mut rest = line;
     while let Some(at) = rest.find("!`") {
-        let starts_word = rest[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| c.is_whitespace() || "([{:".contains(c));
+        // As in Claude Code: only at the start of a line or after whitespace,
+        // so `KEY=!`cmd`` stays literal.
+        let starts_word = out.is_empty() && at == 0
+            || rest[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+            || at == 0 && out.ends_with(char::is_whitespace);
         let end = rest[at + 2..].find('`');
         match end {
             Some(end) if starts_word && end > 0 => {
@@ -280,12 +284,12 @@ mod tests {
             Ok(format!("<{cmd}>\n"))
         };
         let out = expand_inline(
-            "Branch: !`git branch` and (!`date`), not a!`b` or !``",
+            "Branch: !`git branch` and !`date`, not a!`b`, (!`c`) or !``",
             &mut f,
         );
         assert_eq!(
             out.unwrap(),
-            "Branch: <git branch> and (<date>), not a!`b` or !``"
+            "Branch: <git branch> and <date>, not a!`b`, (!`c`) or !``"
         );
         assert_eq!(seen, ["git branch", "date"]);
     }

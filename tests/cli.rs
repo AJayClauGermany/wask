@@ -328,3 +328,163 @@ fn context_injection_needs_approval() {
     sb.write("config/config.yaml", "context: deny\n");
     assert_eq!(sb.run(&["--render"]).code, 2);
 }
+
+const MARKED_SKILL: &str = r#"---
+name: deployer
+description: Deploys things.
+metadata:
+  wask.prefix: "task:"
+---
+
+# Deployer
+
+Read @notes.md first: a reference for the reader, not an import.
+
+## Building
+
+To build, run `wask build`:
+
+```bash
+wask build --release
+```
+
+### task: build
+
+> Build the project
+
+```bash example
+wask build
+```
+
+```bash
+echo building
+```
+
+## Deploying
+
+### task: deploy (env)
+
+> Deploy to an environment
+
+```sh
+echo "deploying $env"
+```
+
+### task: Why this?
+
+### task: broken
+
+```shell
+echo nope
+```
+
+## task: db
+
+### Notes
+
+Prose inside a group does not break it.
+
+### task: migrate
+
+```sh
+echo migrating
+```
+"#;
+
+#[test]
+fn a_prefix_marks_commands_among_docs() {
+    let sb = Sandbox::new("prefix");
+    sb.write("SKILL.md", MARKED_SKILL)
+        .write("WASK.md", "# Tasks\n\n@SKILL.md\n");
+
+    let help = sb.run(&[]);
+    assert_eq!(help.code, 0);
+    assert!(
+        help.stdout
+            .contains("deploy <env>  Deploy to an environment")
+    );
+    assert!(help.stdout.contains("db ..."));
+    assert!(!help.stdout.contains("Building"));
+    // Marked headings that cannot be commands say so, with a location.
+    assert!(
+        help.stderr
+            .contains("SKILL.md:42: `task: Why this?` is marked")
+    );
+    assert!(help.stderr.contains("SKILL.md:44: `broken` is marked"));
+    assert!(!help.stderr.contains("notes.md"), "{}", help.stderr);
+
+    // The example block is skipped; the real script runs.
+    assert_eq!(sb.run(&["build"]).stdout, "building\n");
+    assert_eq!(sb.run(&["deploy", "prod"]).stdout, "deploying prod\n");
+    assert_eq!(sb.run(&["db", "migrate"]).stdout, "migrating\n");
+
+    let prose = sb.run(&["Building"]);
+    assert_eq!(prose.code, 2);
+    assert!(
+        prose
+            .stderr
+            .contains("`Building` at SKILL.md:12 is not a command: it does not start with `task:`"),
+        "{}",
+        prose.stderr
+    );
+}
+
+#[test]
+fn example_blocks_and_ambiguous_scripts() {
+    let sb = Sandbox::new("examples");
+    let body = "## deploy (env)\n\nExample:\n\n```bash\necho \"example $env\"\n```\n\n\
+                ```bash\necho \"real $env\"\n```\n\n## safe\n\n```sh ignore\necho no\n```\n\n\
+                ```sh\necho yes\n```\n";
+    sb.write("WASK.md", body).write("maskfile.md", body);
+
+    // In a wask file two candidate scripts are an error, not a guess.
+    let out = sb.run(&["deploy", "x"]);
+    assert_eq!((out.code, out.stdout.as_str()), (2, ""));
+    assert!(
+        out.stderr
+            .contains("WASK.md:1) cannot run: it has 2 code blocks")
+    );
+    assert!(out.stderr.contains("```bash example"));
+    assert_eq!(sb.run(&["safe"]).stdout, "yes\n");
+    let json = sb.run(&["--introspect"]).stdout;
+    assert!(json.contains(r#""error":"it has 2 code blocks"#), "{json}");
+    assert!(json.contains(r#""usage":"wask safe [OPTIONS]","file":"#));
+
+    // A maskfile runs the last one, as mask does.
+    let mask = sb.run(&["--file", "maskfile.md", "deploy", "x"]);
+    assert_eq!(mask.stdout, "real x\n");
+}
+
+#[test]
+fn explains_why_a_heading_is_not_a_command() {
+    let sb = Sandbox::new("explain");
+    sb.write(
+        "WASK.md",
+        "## build\n\n```sh\necho build\n```\n\n## lint\n\n```shell\ncargo clippy\n```\n",
+    )
+    .write(
+        "README.md",
+        "# Project\n\n## Setup\n\n```sh\necho setup\n```\n\n## Tasks\n\n### test\n\n```sh\necho test\n```\n",
+    );
+
+    let lint = sb.run(&["lint"]);
+    assert_eq!(lint.code, 2);
+    assert!(lint.stderr.contains("`lint` at WASK.md:7 is not a command"));
+    assert!(lint.stderr.contains("its code block is `shell`"));
+
+    let typo = sb.run(&["biuld"]);
+    assert!(
+        typo.stderr.contains("did you mean `build`?"),
+        "{}",
+        typo.stderr
+    );
+
+    // xc's convention: a README's `## Tasks` section holds the commands.
+    assert_eq!(sb.run(&["--file", "README.md", "test"]).stdout, "test\n");
+    let setup = sb.run(&["--file", "README.md", "Setup"]);
+    assert!(
+        setup
+            .stderr
+            .contains("only headings under `Commands` or `Tasks`")
+    );
+}

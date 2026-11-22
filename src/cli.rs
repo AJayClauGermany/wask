@@ -1,6 +1,6 @@
 //! Matching command-line tokens against the command tree, and help output.
 
-use crate::model::{Arg, Command, Kind, Opt, env_name};
+use crate::model::{Arg, Command, Kind, NearMiss, Opt, env_name};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -16,8 +16,13 @@ pub enum Parsed {
     Help,
 }
 
-/// Walks subcommand names. `help` is accepted at any level.
-pub fn resolve<'a>(top: &'a [Command], tokens: &'a [String]) -> Result<Resolved<'a>, String> {
+/// Walks subcommand names. `help` is accepted at any level. `near` lists
+/// headings that are not commands, to explain why when one is asked for.
+pub fn resolve<'a>(
+    top: &'a [Command],
+    near: &[NearMiss],
+    tokens: &'a [String],
+) -> Result<Resolved<'a>, String> {
     let mut path: Vec<&Command> = Vec::new();
     let mut subs = top;
     let mut i = 0;
@@ -37,11 +42,7 @@ pub fn resolve<'a>(top: &'a [Command], tokens: &'a [String]) -> Result<Resolved<
     let stray = rest.first().filter(|t| !t.starts_with('-'));
     let runnable = path.last().is_some_and(|c| c.script.is_some());
     if let Some(stray) = stray.filter(|_| help || !runnable) {
-        let names: Vec<&str> = subs.iter().map(|c| c.name.as_str()).collect();
-        return Err(format!(
-            "unknown command `{stray}` (available: {})",
-            names.join(", ")
-        ));
+        return Err(unknown_command(stray, subs, near));
     }
     if help || !runnable {
         if let Some(flag) = rest.iter().find(|t| !matches!(t.as_str(), "-h" | "--help")) {
@@ -50,6 +51,82 @@ pub fn resolve<'a>(top: &'a [Command], tokens: &'a [String]) -> Result<Resolved<
         return Ok(Resolved::Help(path));
     }
     Ok(Resolved::Invoke(path, rest))
+}
+
+fn unknown_command(name: &str, subs: &[Command], near: &[NearMiss]) -> String {
+    let names: Vec<&str> = subs.iter().map(|c| c.name.as_str()).collect();
+    let mut msg = format!("unknown command `{name}`");
+    let miss = near
+        .iter()
+        .find(|n| n.name == name)
+        .or_else(|| near.iter().find(|n| n.name.eq_ignore_ascii_case(name)));
+    if miss.is_none()
+        && let Some(close) = closest(name, &names)
+    {
+        write!(msg, ", did you mean `{close}`?").unwrap();
+    }
+    if names.is_empty() {
+        msg.push_str(" (there are no subcommands here)");
+    } else {
+        write!(msg, " (available: {})", names.join(", ")).unwrap();
+    }
+    if let Some(miss) = miss {
+        write!(
+            msg,
+            "\n\nThe heading `{}` at {}:{} is not a command: {}.",
+            miss.name,
+            crate::markdown::relative(&miss.file),
+            miss.line,
+            miss.reason
+        )
+        .unwrap();
+    }
+    msg
+}
+
+/// The candidate a typo most likely meant, if any is close enough.
+fn closest<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let limit = if name.chars().count() <= 3 { 1 } else { 2 };
+    candidates
+        .iter()
+        .map(|c| {
+            let d = if c.eq_ignore_ascii_case(name) {
+                0
+            } else {
+                distance(name, c)
+            };
+            (d, *c)
+        })
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+/// Edit distance: insertions, deletions, substitutions and swaps of two
+/// neighbouring characters each cost one.
+fn distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in rows[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut d = (rows[i - 1][j] + 1)
+                .min(rows[i][j - 1] + 1)
+                .min(rows[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d = d.min(rows[i - 2][j - 2] + 1);
+            }
+            rows[i][j] = d;
+        }
+    }
+    rows[a.len()][b.len()]
 }
 
 /// Every command gets `-v/--verbose` unless it defines those itself.
@@ -390,8 +467,11 @@ mod tests {
                 lang: "sh".into(),
                 source: String::new(),
             }),
+            conflict: None,
             subs: Vec::new(),
             dir: ".".into(),
+            file: "WASK.md".into(),
+            line: 1,
             settings: Rc::new(Settings::default()),
         }
     }
@@ -416,6 +496,15 @@ mod tests {
         assert_eq!(get("color"), Some("red"));
         assert_eq!(run(&["site", "-p8080"]).unwrap()[1].1, "8080");
         assert_eq!(run(&["-5", "-p", "1"]).unwrap()[0].1, "-5");
+    }
+
+    #[test]
+    fn suggests_close_names() {
+        assert_eq!(closest("biuld", &["build", "test"]), Some("build"));
+        assert_eq!(closest("Build", &["build"]), Some("build"));
+        assert_eq!(closest("tst", &["test", "lint"]), Some("test"));
+        assert_eq!(closest("deploy", &["build", "test"]), None);
+        assert_eq!(distance("kitten", "sitting"), 3);
     }
 
     #[test]
