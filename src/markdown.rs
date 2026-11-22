@@ -7,9 +7,10 @@
 //! and frontmatter configures how the file is read and run.
 
 use crate::config::{self, Settings};
-use crate::model::{Arg, Command, Kind, Opt, Script};
+use crate::model::{Arg, Command, Kind, NearMiss, Opt, Script};
 use crate::yaml;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -22,10 +23,66 @@ pub struct Doc {
     pub title: Option<String>,
     pub description: Option<String>,
     pub commands: Vec<Command>,
+    /// Headings that look like commands but are documentation, so that asking
+    /// for one can say why.
+    pub near_misses: Vec<NearMiss>,
 }
 
 pub fn warn(msg: &str) {
     eprintln!("wask: warning: {msg}");
+}
+
+/// A path relative to the current directory when it is below it, for
+/// messages.
+pub fn relative(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Info-string words that mark a code block as an example, never a script:
+/// ```` ```bash example ````, rustdoc's `ignore` and `no_run`, or Runme's
+/// `{ ignore=true }`.
+const EXAMPLE_FLAGS: &[&str] = &["example", "ignore", "no_run", "no-run", "norun"];
+
+/// Where commands live in a file that is not a WASK.md or maskfile.md, unless
+/// its frontmatter says otherwise. `Tasks` is xc's convention.
+const DEFAULT_SECTIONS: &[&str] = &["Commands", "Tasks"];
+
+/// How a file says which of its headings are commands.
+struct Rules {
+    /// Only headings under the first heading with one of these names are
+    /// read; `None` reads the whole file.
+    section: Option<Vec<String>>,
+    /// Only headings starting with this marker are commands.
+    prefix: Option<String>,
+    /// Whether `@file.md` links outside command headings import. In a skill
+    /// that marks its commands, a link in the prose is a reference for the
+    /// reader, not an import.
+    prose_imports: bool,
+}
+
+impl Rules {
+    /// The heading title with the marker removed, or `None` if it is unmarked.
+    fn strip<'a>(&self, title: &'a str) -> Option<&'a str> {
+        let Some(prefix) = &self.prefix else {
+            return Some(title);
+        };
+        let head = title.get(..prefix.len())?;
+        head.eq_ignore_ascii_case(prefix)
+            .then(|| title[prefix.len()..].trim_start())
+    }
+
+    fn unmarked_reason(&self) -> String {
+        let prefix = self.prefix.as_deref().unwrap_or_default();
+        format!(
+            "it does not start with `{prefix}`, which this file uses to mark commands \
+             (`prefix: \"{prefix}\"` in its frontmatter)"
+        )
+    }
 }
 
 /// Loads `path` and everything it imports. `whole` forces maskfile semantics
@@ -45,10 +102,12 @@ pub fn load(
         return Err(format!("more than {MAX_FILES} files imported; giving up"));
     }
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let loc = |line: usize| format!("{}:{line}", relative(&path));
 
     let mut doc = Doc::default();
     let mut settings = base.clone();
     let mut section = None;
+    let mut prefix = None;
     let (front, body) = yaml::split_frontmatter(&src);
     if let Some(front) = front {
         let pairs =
@@ -63,53 +122,73 @@ pub fn load(
             match key {
                 "name" => doc.name = Some(value),
                 "description" => doc.description = Some(value),
+                // How the file is read is the file's own business, so these
+                // two are not settings: they are neither inherited by imports
+                // nor accepted from the global config.
                 "wask.section" => section = Some(value),
+                "wask.prefix" => prefix = Some(value).filter(|p| !p.trim().is_empty()),
                 _ => {
                     if let Some(key) = key.strip_prefix("wask.")
                         && let Err(e) = settings.apply(key, &value, false)
                     {
-                        warn(&format!("{}: {e}", path.display()));
+                        warn(&format!("{}: {e}", relative(&path)));
                     }
                 }
             }
         }
     }
     let settings = Rc::new(settings);
+    let first_line = src.len() - body.len();
+    let first_line = src[..first_line].matches('\n').count() + 1;
 
     // WASK.md and maskfile.md are task files through and through. Any other
     // file (a SKILL.md, say) is mostly prose with example snippets, so only
-    // its "Commands" section is read unless frontmatter says otherwise.
+    // its "Commands" (or "Tasks") section is read, unless frontmatter picks
+    // another section or a prefix that marks commands wherever they are.
     let file_name = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
-    let task_file = whole || matches!(file_name.as_deref(), Some("wask.md" | "maskfile.md"));
-    let section = match section {
-        Some(s) if s == "*" => None,
-        Some(s) => Some(s),
-        None if task_file => None,
-        None => Some("Commands".to_string()),
+    let maskfile = whole || file_name.as_deref() == Some("maskfile.md");
+    let task_file = maskfile || file_name.as_deref() == Some("wask.md");
+    let rules = Rules {
+        prose_imports: task_file || prefix.is_none() || section.is_some(),
+        section: match section {
+            Some(s) if s == "*" => None,
+            Some(s) => Some(vec![s]),
+            None if task_file || prefix.is_some() => None,
+            None => Some(DEFAULT_SECTIONS.iter().map(|s| s.to_string()).collect()),
+        },
+        prefix,
     };
+    let pick = |blocks: &[Block]| pick_block(blocks, &settings, maskfile);
 
-    let sections = scan(body);
+    let sections = scan(body, first_line);
     let h1 = sections.iter().find(|s| s.level == 1);
     doc.title = h1.map(|s| s.title.clone());
     if doc.description.is_none() {
         doc.description = h1.and_then(|s| s.quote.clone().or_else(|| s.para.clone()));
     }
 
-    let (root_secs, cmd_secs): (Vec<&Section>, Vec<&Section>) = match &section {
-        None => sections.iter().partition(|s| s.level <= 1),
-        Some(name) => {
+    // Which sections hold commands, and which ones' `@file.md` links import
+    // at the top level (the title area, or the commands section's heading).
+    let (roots, scope): (Vec<usize>, Range<usize>) = match &rules.section {
+        None => {
+            let roots: Vec<usize> = (0..sections.len())
+                .filter(|&i| sections[i].level <= 1)
+                .collect();
+            (roots, 0..sections.len())
+        }
+        Some(names) => {
             let found = sections
                 .iter()
-                .position(|s| s.level > 0 && s.title.eq_ignore_ascii_case(name));
+                .position(|s| s.level > 0 && names.iter().any(|n| s.title.eq_ignore_ascii_case(n)));
             match found {
-                None => (Vec::new(), Vec::new()),
+                None => (Vec::new(), 0..0),
                 Some(i) => {
                     let level = sections[i].level;
                     let end = sections[i + 1..]
                         .iter()
                         .position(|s| s.level <= level)
                         .map_or(sections.len(), |p| i + 1 + p);
-                    (vec![&sections[i]], sections[i + 1..end].iter().collect())
+                    (vec![i], i + 1..end)
                 }
             }
         }
@@ -120,26 +199,75 @@ pub fn load(
         level: usize,
         parent: Option<usize>,
         imports: Vec<PathBuf>,
+        /// Explicitly marked with the prefix, so failing to be a command is
+        /// worth a warning rather than silence.
+        marked: bool,
+        /// Why the code blocks it has could not be its script.
+        unrunnable: Option<String>,
     }
     let mut nodes: Vec<Node> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let mut top_imports: Vec<PathBuf> = Vec::new();
     let is_md = |link: &str| link.to_ascii_lowercase().ends_with(".md");
+    let md_links = |s: &Section| -> Vec<PathBuf> {
+        if !rules.prose_imports {
+            return Vec::new();
+        }
+        s.links
+            .iter()
+            .filter(|l| is_md(l))
+            .map(|l| resolve(&dir, l))
+            .collect()
+    };
+    let mut near = |s: &Section, name: &str, reason: String| {
+        doc.near_misses.push(NearMiss {
+            name: name.to_string(),
+            file: path.clone(),
+            line: s.line,
+            reason,
+        });
+    };
 
-    for s in root_secs {
-        top_imports.extend(
-            s.links
-                .iter()
-                .filter(|l| is_md(l))
-                .map(|l| resolve(&dir, l)),
-        );
-    }
-    for s in cmd_secs {
-        while stack.last().is_some_and(|&i| nodes[i].level >= s.level) {
+    for (i, s) in sections.iter().enumerate() {
+        if roots.contains(&i) {
+            top_imports.extend(md_links(s));
+            continue;
+        }
+        if !scope.contains(&i) {
+            if let (Some(name), Some(names)) = (lone_name(&s.title), &rules.section)
+                && pick(&s.blocks).script.is_some()
+            {
+                let names: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+                near(
+                    s,
+                    &name,
+                    format!(
+                        "in this file only headings under {} are commands",
+                        names.join(" or ")
+                    ),
+                );
+            }
+            continue;
+        }
+        while stack.last().is_some_and(|&n| nodes[n].level >= s.level) {
             stack.pop();
         }
         let parent = stack.last().copied();
-        let parsed = parse_title(&s.title).and_then(|(mut names, args)| {
+        let marked = rules.prefix.is_some();
+        let Some(title) = rules.strip(&s.title) else {
+            // Unmarked: documentation, transparent like any prose heading.
+            if let Some(name) = lone_name(&s.title)
+                && pick(&s.blocks).script.is_some()
+            {
+                near(s, &name, rules.unmarked_reason());
+            }
+            match parent {
+                Some(p) => nodes[p].imports.extend(md_links(s)),
+                None => top_imports.extend(md_links(s)),
+            }
+            continue;
+        };
+        let parsed = parse_title(title).and_then(|(mut names, args)| {
             // `### services start` under `## services` may repeat its parents.
             let mut prefix = Vec::new();
             let mut at = parent;
@@ -152,21 +280,24 @@ pub fn load(
             }
             (names.len() == 1).then(|| (names.remove(0), args))
         });
-        let md_links = s
-            .links
-            .iter()
-            .filter(|l| is_md(l))
-            .map(|l| resolve(&dir, l));
         let Some((name, args)) = parsed else {
+            if marked {
+                warn(&format!(
+                    "{}: `{}` is marked as a command, but `{title}` is not a command \
+                     heading: a name, then (required), [optional] or [rest...] arguments",
+                    loc(s.line),
+                    s.title
+                ));
+            }
             // A prose heading: transparent, its imports land one level up.
             match parent {
-                Some(p) => nodes[p].imports.extend(md_links),
-                None => top_imports.extend(md_links),
+                Some(p) => nodes[p].imports.extend(md_links(s)),
+                None => top_imports.extend(md_links(s)),
             }
             continue;
         };
-        let imports: Vec<PathBuf> = md_links.collect();
-        let script = pick_block(&s.blocks, &settings).or_else(|| {
+        let Picked { script, conflict } = pick(&s.blocks);
+        let script = script.or_else(|| {
             s.links
                 .iter()
                 .filter(|l| !is_md(l))
@@ -185,23 +316,33 @@ pub fn load(
                 args,
                 options: s.opts.clone(),
                 script,
+                conflict,
                 subs: Vec::new(),
                 dir: dir.clone(),
+                file: path.clone(),
+                line: s.line,
                 settings: settings.clone(),
             },
             level: s.level,
             parent,
-            imports,
+            imports: s
+                .links
+                .iter()
+                .filter(|l| is_md(l))
+                .map(|l| resolve(&dir, l))
+                .collect(),
+            marked,
+            unrunnable: unrunnable(s, &dir),
         });
         stack.push(nodes.len() - 1);
     }
 
-    let mut import = |target: &Path, doc: Option<&mut Doc>| -> Result<Vec<Command>, String> {
+    let mut import = |target: &Path, doc: &mut Doc, top: bool| -> Result<Vec<Command>, String> {
         let Ok(target) = target.canonicalize() else {
             warn(&format!(
                 "{}: import not found: {}",
-                path.display(),
-                target.display()
+                relative(&path),
+                relative(target)
             ));
             return Ok(Vec::new());
         };
@@ -209,11 +350,12 @@ pub fn load(
             return Ok(Vec::new());
         }
         let imported = load(&target, &settings, false, seen)?;
-        if let Some(doc) = doc {
+        if top {
             doc.name = doc.name.take().or(imported.name);
             doc.title = doc.title.take().or(imported.title);
             doc.description = doc.description.take().or(imported.description);
         }
+        doc.near_misses.extend(imported.near_misses);
         Ok(imported.commands)
     };
 
@@ -226,11 +368,34 @@ pub fn load(
         cmd.subs = std::mem::take(&mut children[i]);
         cmd.subs.reverse();
         for target in &node.imports {
-            cmd.subs.extend(import(target, None)?);
+            cmd.subs.extend(import(target, &mut doc, false)?);
         }
         dedup(&mut cmd.subs, &path);
         if cmd.script.is_none() && cmd.subs.is_empty() {
-            continue; // a heading that is only documentation
+            // A heading that is only documentation.
+            if let Some(reason) = node.unrunnable {
+                if node.marked {
+                    warn(&format!(
+                        "{}: `{}` is marked as a command, but {reason}",
+                        loc(cmd.line),
+                        cmd.name
+                    ));
+                }
+                doc.near_misses.push(NearMiss {
+                    name: cmd.name,
+                    file: cmd.file,
+                    line: cmd.line,
+                    reason,
+                });
+            } else if node.marked {
+                warn(&format!(
+                    "{}: `{}` is marked as a command, but has no code block, \
+                     `@script` link or subcommands",
+                    loc(cmd.line),
+                    cmd.name
+                ));
+            }
+            continue;
         }
         match node.parent {
             Some(p) => children[p].push(cmd),
@@ -239,11 +404,55 @@ pub fn load(
     }
     top.reverse();
     for target in &top_imports {
-        top.extend(import(target, Some(&mut doc))?);
+        top.extend(import(target, &mut doc, true)?);
     }
     dedup(&mut top, &path);
     doc.commands = top;
     Ok(doc)
+}
+
+/// The command name a heading would have on its own, if it reads as one.
+fn lone_name(title: &str) -> Option<String> {
+    let (mut names, _) = parse_title(title)?;
+    (names.len() == 1).then(|| names.remove(0))
+}
+
+/// Why a heading that has code blocks or script links has no script.
+fn unrunnable(s: &Section, dir: &Path) -> Option<String> {
+    let missing = s
+        .links
+        .iter()
+        .find(|l| !l.to_ascii_lowercase().ends_with(".md") && !resolve(dir, l).is_file());
+    if let Some(link) = missing.filter(|_| s.blocks.is_empty()) {
+        return Some(format!("its script `@{link}` was not found"));
+    }
+    let blocks = &s.blocks;
+    if blocks.is_empty() {
+        return None;
+    }
+    if blocks.iter().all(|b| b.example) {
+        return Some("its code blocks are all marked as examples".into());
+    }
+    let mut langs: Vec<String> = Vec::new();
+    for b in blocks.iter().filter(|b| !b.example) {
+        let lang = if b.lang.is_empty() {
+            "(no language)".to_string()
+        } else {
+            format!("`{}`", b.lang)
+        };
+        if !langs.contains(&lang) {
+            langs.push(lang);
+        }
+    }
+    let what = if langs.len() == 1 {
+        format!("its code block is {}", langs[0])
+    } else {
+        format!("its code blocks are {}", langs.join(", "))
+    };
+    Some(format!(
+        "{what}, and wask has no runner for that: use a language such as `sh`, `bash` \
+         or `python`, or add one under `runners:`"
+    ))
 }
 
 fn dedup(cmds: &mut Vec<Command>, path: &Path) {
@@ -252,7 +461,7 @@ fn dedup(cmds: &mut Vec<Command>, path: &Path) {
         if names.contains(&c.name) {
             warn(&format!(
                 "{}: duplicate command `{}` ignored",
-                path.display(),
+                relative(path),
                 c.name
             ));
             return false;
@@ -271,22 +480,52 @@ fn resolve(dir: &Path, link: &str) -> PathBuf {
     dir.join(link) // `join` keeps absolute links as they are
 }
 
-/// The first block that can run here: a platform-specific one if present.
-fn pick_block(blocks: &[(String, String)], settings: &Settings) -> Option<Script> {
-    let known = |lang: &str| settings.runner(lang).is_some();
-    blocks
-        .iter()
-        .find(|(l, _)| known(l) && config::is_windows_lang(l) == cfg!(windows))
-        .or_else(|| blocks.iter().find(|(l, _)| known(l)))
-        .map(|(lang, source)| Script::Inline {
-            lang: lang.clone(),
-            source: source.clone(),
-        })
+struct Picked {
+    script: Option<Script>,
+    /// Why the script is not clear-cut: more than one block could be it.
+    conflict: Option<String>,
 }
 
-/// `name (required) [optional] [rest...]`, optionally wrapped in backticks.
+/// The block that runs here, preferring ones written for this platform.
+/// Blocks marked as examples never run. A maskfile runs the last candidate,
+/// as mask does; anywhere else, more than one candidate is a conflict that
+/// stops the command from running rather than a guess.
+fn pick_block(blocks: &[Block], settings: &Settings, maskfile: bool) -> Picked {
+    let usable: Vec<&Block> = blocks
+        .iter()
+        .filter(|b| !b.example && settings.runner(&b.lang).is_some())
+        .collect();
+    let native: Vec<&Block> = usable
+        .iter()
+        .copied()
+        .filter(|b| config::is_windows_lang(&b.lang) == cfg!(windows))
+        .collect();
+    // Blocks for another platform are a fallback, not competing candidates.
+    let competing = native.len() > 1 && !maskfile;
+    let pool = if native.is_empty() { usable } else { native };
+    let chosen = if maskfile { pool.last() } else { pool.first() };
+    let conflict = competing.then(|| {
+        format!(
+            "it has {} code blocks that could be its script, and wask will not guess \
+             which one to run. Mark each block that is not the script as an example: \
+             ```{} example",
+            pool.len(),
+            pool[1].lang
+        )
+    });
+    Picked {
+        script: chosen.map(|b| Script::Inline {
+            lang: b.lang.clone(),
+            source: b.source.clone(),
+        }),
+        conflict,
+    }
+}
+
+/// `name (required) [optional] [rest...]`. Backticks are ignored, so
+/// `` `build (target)` `` and `` `build` (target) `` read the same.
 fn parse_title(title: &str) -> Option<(Vec<String>, Vec<Arg>)> {
-    let title = title.trim().trim_matches('`');
+    let title = title.replace('`', "");
     let mut names = Vec::new();
     let mut args: Vec<Arg> = Vec::new();
     for token in title.split_whitespace() {
@@ -340,19 +579,30 @@ fn parse_title(title: &str) -> Option<(Vec<String>, Vec<Arg>)> {
 struct Section {
     level: usize,
     title: String,
+    /// Line of the heading in the file.
+    line: usize,
     quote: Option<String>,
     para: Option<String>,
-    blocks: Vec<(String, String)>,
+    blocks: Vec<Block>,
     opts: Vec<Opt>,
     links: Vec<String>,
 }
 
-/// An open code fence: marker char, marker length, indent, language, lines.
+#[derive(Debug)]
+struct Block {
+    lang: String,
+    source: String,
+    example: bool,
+}
+
+/// An open code fence: marker char, marker length, indent, language, and
+/// whether the info string marks it as an example.
 pub struct Fence {
     ch: char,
     len: usize,
     indent: usize,
     pub lang: String,
+    pub example: bool,
 }
 
 impl Fence {
@@ -364,16 +614,29 @@ impl Fence {
         if len < 3 || (ch == '`' && info.contains('`')) {
             return None;
         }
-        let lang = info
-            .split(|c: char| c.is_whitespace() || c == '{' || c == ',')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let mut words = info
+            .split(|c: char| c.is_whitespace() || c == '{' || c == '}' || c == ',')
+            .filter(|w| !w.is_empty());
+        let lang = match info.starts_with('{') {
+            true => String::new(),
+            false => words.next().unwrap_or("").to_ascii_lowercase(),
+        };
+        // `bash example`, `bash,ignore`, `bash {.no_run}`, `sh { ignore=true }`,
+        // `sh {"ignore":"true"}`.
+        let example = words.any(|w| {
+            let w = w.trim_start_matches('.').to_ascii_lowercase();
+            let (key, value) = match w.split_once(['=', ':']) {
+                Some((k, v)) => (k.trim_matches('"'), Some(v.trim_matches('"'))),
+                None => (w.as_str(), None),
+            };
+            EXAMPLE_FLAGS.contains(&key) && value.is_none_or(|v| yaml::parse_bool(v) == Some(true))
+        });
         Some(Fence {
             ch,
             len,
             indent: line.len() - text.len(),
             lang,
+            example,
         })
     }
 
@@ -409,19 +672,25 @@ fn bullet(line: &str) -> Option<(usize, &str)> {
     Some((line.len() - text.len(), rest.trim()))
 }
 
-fn scan(body: &str) -> Vec<Section> {
+/// Splits the body into sections, one per heading. `first_line` is the line
+/// number of the body's first line in the file.
+fn scan(body: &str, first_line: usize) -> Vec<Section> {
     let mut secs = vec![Section::default()];
     let mut fence: Option<(Fence, Vec<&str>)> = None;
     // Inside an OPTIONS list: the indent of its top-level bullets, once known.
     let mut opts: Option<Option<usize>> = None;
 
-    for line in body.lines() {
+    for (n, line) in body.lines().enumerate() {
         let cur = secs.last_mut().expect("starts non-empty");
         if let Some((f, buf)) = &mut fence {
             if f.closes(line) {
                 let mut source = buf.join("\n");
                 source.push('\n');
-                cur.blocks.push((f.lang.clone(), source));
+                cur.blocks.push(Block {
+                    lang: f.lang.clone(),
+                    source,
+                    example: f.example,
+                });
                 fence = None;
             } else {
                 buf.push(f.strip(line));
@@ -468,6 +737,7 @@ fn scan(body: &str) -> Vec<Section> {
         if (1..=6).contains(&hashes) && text[hashes..].starts_with([' ', '\t']) {
             secs.push(Section {
                 level: hashes,
+                line: first_line + n,
                 title: text[hashes..]
                     .trim()
                     .trim_end_matches('#')
@@ -559,6 +829,44 @@ mod tests {
         assert!(parse_title("Why (not) this?").is_none());
         assert!(parse_title("build (a...) (b)").is_none());
         assert_eq!(parse_title("`lint`").unwrap().0, ["lint"]);
+        assert_eq!(parse_title("`lint` (dir)").unwrap().1[0].name, "dir");
+    }
+
+    #[test]
+    fn fence_flags() {
+        let open = |line: &str| Fence::open(line).map(|f| (f.lang, f.example));
+        assert_eq!(open("```bash"), Some(("bash".into(), false)));
+        assert_eq!(open("```bash example"), Some(("bash".into(), true)));
+        assert_eq!(open("```rust,ignore"), Some(("rust".into(), true)));
+        assert_eq!(open("~~~sh {.no_run}"), Some(("sh".into(), true)));
+        assert_eq!(open("```sh title=\"example\""), Some(("sh".into(), false)));
+        assert_eq!(open("```{example}"), Some((String::new(), true)));
+        assert_eq!(open("```sh { ignore=true }"), Some(("sh".into(), true)));
+        assert_eq!(
+            open("```sh {\"ignore\":\"false\"}"),
+            Some(("sh".into(), false))
+        );
+    }
+
+    #[test]
+    fn prefix_rules() {
+        let rules = Rules {
+            section: None,
+            prefix: Some("task:".into()),
+            prose_imports: false,
+        };
+        assert_eq!(rules.strip("task: build (x)"), Some("build (x)"));
+        assert_eq!(rules.strip("Task:build"), Some("build"));
+        assert_eq!(rules.strip("Building"), None);
+        let ticks = Rules {
+            section: None,
+            prefix: Some("`".into()),
+            prose_imports: false,
+        };
+        assert_eq!(
+            parse_title(ticks.strip("`build` [x]").unwrap()).unwrap().0,
+            ["build"]
+        );
     }
 
     #[test]
@@ -566,13 +874,15 @@ mod tests {
         let secs = scan(
             "# Title\n\nIntro with @SKILL.md link.\n\n## serve (dir)\n\n> Serve files\n\n\
              **OPTIONS**\n* port\n    * flags: -p --port\n    * type: number\n    * required\n\
-             * watch\n\n~~~bash\necho \"## not a heading\"\n~~~\n",
+             * watch\n\n~~~bash\necho \"## not a heading\"\n~~~\n\n```sh example\nwask serve\n```\n",
+            3,
         );
         assert_eq!(secs.len(), 3);
         assert_eq!(secs[1].links, ["SKILL.md"]);
         let serve = &secs[2];
         assert_eq!(serve.quote.as_deref(), Some("Serve files"));
-        assert_eq!(serve.blocks[0].0, "bash");
+        assert_eq!((serve.line, serve.blocks[0].lang.as_str()), (7, "bash"));
+        assert!(!serve.blocks[0].example && serve.blocks[1].example);
         assert_eq!(serve.opts.len(), 2);
         assert_eq!(serve.opts[0].short, Some('p'));
         assert!(serve.opts[0].required && serve.opts[0].kind == Kind::Number);

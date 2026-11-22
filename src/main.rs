@@ -130,11 +130,22 @@ fn real_main() -> Result<u8, String> {
     let title = doc.title.as_deref().or(doc.name.as_deref());
     let root_help = || cli::root_help(title, doc.description.as_deref(), &doc.commands);
     if doc.commands.is_empty() {
-        return Err(format!(
+        let mut msg = format!(
             "{}: no commands found. Commands are headings with a code block; in files \
-             other than WASK.md and maskfile.md they go under a `## Commands` heading.",
-            root.display()
-        ));
+             other than WASK.md and maskfile.md they go under a `## Commands` (or \
+             `## Tasks`) heading, or are marked with the `prefix:` set in frontmatter.",
+            markdown::relative(&root)
+        );
+        for miss in doc.near_misses.iter().take(5) {
+            msg.push_str(&format!(
+                "\n\n`{}` at {}:{} is not a command: {}.",
+                miss.name,
+                markdown::relative(&miss.file),
+                miss.line,
+                miss.reason
+            ));
+        }
+        return Err(msg);
     }
     if help && rest.is_empty() {
         print!("{}", root_help());
@@ -148,7 +159,7 @@ fn real_main() -> Result<u8, String> {
             print!("{}", cli::command_help(path));
         }
     };
-    let (path, tokens) = match cli::resolve(&doc.commands, rest)? {
+    let (path, tokens) = match cli::resolve(&doc.commands, &doc.near_misses, rest)? {
         cli::Resolved::Help(path) => {
             print_help(&path);
             return Ok(0);

@@ -77,6 +77,11 @@ impl Settings {
                     ));
                 }
             };
+        } else if key == "prefix" || key == "section" {
+            return Err(format!(
+                "`{key}` says how a file is written, so it belongs in that file's \
+                 frontmatter, not here"
+            ));
         } else {
             return Err(format!("unknown setting `{key}`"));
         }
